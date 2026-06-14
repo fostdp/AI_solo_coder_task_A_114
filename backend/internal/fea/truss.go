@@ -4,14 +4,44 @@ import (
 	"math"
 )
 
+type JointType string
+
+const (
+	JointMortiseTenon  JointType = "mortise_tenon"
+	JointDovetail      JointType = "dovetail"
+	JointLap           JointType = "lap"
+	JointRigid         JointType = "rigid"
+	JointPin           JointType = "pin"
+)
+
+type SemiRigidJoint struct {
+	Ktheta  float64
+	Kt      float64
+	Kaxial  float64
+	Rtheta  float64
+	Type    JointType
+}
+
+var defaultJointStiffness = map[JointType]SemiRigidJoint{
+	JointMortiseTenon: {Ktheta: 0.65, Kt: 0.80, Kaxial: 0.90, Rtheta: 1.0, Type: JointMortiseTenon},
+	JointDovetail:     {Ktheta: 0.75, Kt: 0.85, Kaxial: 0.70, Rtheta: 1.0, Type: JointDovetail},
+	JointLap:          {Ktheta: 0.55, Kt: 0.60, Kaxial: 0.50, Rtheta: 1.0, Type: JointLap},
+	JointRigid:        {Ktheta: 1.00, Kt: 1.00, Kaxial: 1.00, Rtheta: 1.0, Type: JointRigid},
+	JointPin:          {Ktheta: 0.02, Kt: 0.95, Kaxial: 0.98, Rtheta: 1.0, Type: JointPin},
+}
+
 type Node struct {
-	ID    int
-	X, Y  float64
-	UX, UY float64
-	RZ     float64
-	FixedX bool
-	FixedY bool
-	FixedR bool
+	ID       int
+	X, Y     float64
+	UX, UY   float64
+	RZ       float64
+	FixedX   bool
+	FixedY   bool
+	FixedR   bool
+	Joint    SemiRigidJoint
+	Ktheta   float64
+	KshearX  float64
+	KshearY  float64
 }
 
 type Member struct {
@@ -23,31 +53,74 @@ type Member struct {
 	I      float64
 	Length float64
 	Angle  float64
+	JointStart JointType
+	JointEnd   JointType
 }
 
 type TrussStructure struct {
-	Nodes    []*Node
-	Members  []*Member
-	NodeMap  map[int]*Node
+	Nodes     []*Node
+	Members   []*Member
+	NodeMap   map[int]*Node
 	MemberMap map[int]*Member
-	K        [][]float64
-	F        []float64
-	U        []float64
-	dofs     int
+	K         [][]float64
+	F         []float64
+	U         []float64
+	dofs      int
+	jointStiffness map[JointType]SemiRigidJoint
+	useSemiRigid   bool
 }
 
 func NewTrussStructure() *TrussStructure {
 	return &TrussStructure{
-		NodeMap:   make(map[int]*Node),
-		MemberMap: make(map[int]*Member),
+		NodeMap:        make(map[int]*Node),
+		MemberMap:      make(map[int]*Member),
+		jointStiffness: defaultJointStiffness,
+		useSemiRigid:   true,
+	}
+}
+
+func (ts *TrussStructure) EnableSemiRigidJoints(enable bool) {
+	ts.useSemiRigid = enable
+}
+
+func (ts *TrussStructure) SetCustomJointStiffness(jointType JointType, ktheta, kt, kaxial float64) {
+	ts.jointStiffness[jointType] = SemiRigidJoint{
+		Ktheta: ktheta,
+		Kt:     kt,
+		Kaxial: kaxial,
+		Type:   jointType,
 	}
 }
 
 func (ts *TrussStructure) AddNode(id int, x, y float64) *Node {
-	node := &Node{ID: id, X: x, Y: y}
+	node := &Node{
+		ID:       id,
+		X:        x,
+		Y:        y,
+		Joint:    ts.jointStiffness[JointMortiseTenon],
+		Ktheta:   0,
+		KshearX:  0,
+		KshearY:  0,
+	}
 	ts.Nodes = append(ts.Nodes, node)
 	ts.NodeMap[id] = node
 	return node
+}
+
+func (ts *TrussStructure) SetNodeJointType(id int, jointType JointType) {
+	if node, exists := ts.NodeMap[id]; exists {
+		if js, ok := ts.jointStiffness[jointType]; ok {
+			node.Joint = js
+		}
+	}
+}
+
+func (ts *TrussStructure) SetNodeCustomStiffness(id int, ktheta, kshearX, kshearY float64) {
+	if node, exists := ts.NodeMap[id]; exists {
+		node.Ktheta = ktheta
+		node.KshearX = kshearX
+		node.KshearY = kshearY
+	}
 }
 
 func (ts *TrussStructure) SetNodeConstraint(id int, fx, fy, fr bool) {
@@ -58,7 +131,7 @@ func (ts *TrussStructure) SetNodeConstraint(id int, fx, fy, fr bool) {
 	}
 }
 
-func (ts *TrussStructure) AddMember(id int, startID, endID int, e, a, i float64) *Member {
+func (ts *TrussStructure) AddMember(id int, startID, endID int, e, a, i float64, jointTypes ...JointType) *Member {
 	start := ts.NodeMap[startID]
 	end := ts.NodeMap[endID]
 	if start == nil || end == nil {
@@ -70,15 +143,26 @@ func (ts *TrussStructure) AddMember(id int, startID, endID int, e, a, i float64)
 	length := math.Sqrt(dx*dx + dy*dy)
 	angle := math.Atan2(dy, dx)
 
+	jointStart := JointMortiseTenon
+	jointEnd := JointMortiseTenon
+	if len(jointTypes) >= 1 {
+		jointStart = jointTypes[0]
+	}
+	if len(jointTypes) >= 2 {
+		jointEnd = jointTypes[1]
+	}
+
 	member := &Member{
-		ID:     id,
-		Start:  start,
-		End:    end,
-		E:      e,
-		A:      a,
-		I:      i,
-		Length: length,
-		Angle:  angle,
+		ID:         id,
+		Start:      start,
+		End:        end,
+		E:          e,
+		A:          a,
+		I:          i,
+		Length:     length,
+		Angle:      angle,
+		JointStart: jointStart,
+		JointEnd:   jointEnd,
 	}
 
 	ts.Members = append(ts.Members, member)
@@ -103,6 +187,60 @@ func (m *Member) LocalStiffness() [6][6]float64 {
 	}
 }
 
+func (m *Member) LocalStiffnessSemiRigid() [6][6]float64 {
+	k0 := m.LocalStiffness()
+	if len(m.Start.Joint.Type) == 0 || len(m.End.Joint.Type) == 0 {
+		return k0
+	}
+
+	js := m.Start.Joint
+	je := m.End.Joint
+	l := m.Length
+	ei := m.E * m.I
+
+	alphaS := ei / l
+	alphaE := ei / l
+
+	var k1, k2, k3, k4 float64
+	if js.Ktheta > 0 && js.Ktheta < 1.0 {
+		k1 = 4 * alphaS / (1 + 4*alphaS/js.Ktheta/ei)
+	} else {
+		k1 = k0[2][2]
+	}
+
+	if je.Ktheta > 0 && je.Ktheta < 1.0 {
+		k4 = 4 * alphaE / (1 + 4*alphaE/je.Ktheta/ei)
+	} else {
+		k4 = k0[5][5]
+	}
+
+	shearFactor := (js.Kt + je.Kt) / 2.0
+	axialFactor := (js.Kaxial + je.Kaxial) / 2.0
+
+	var k [6][6]float64
+	for i := 0; i < 6; i++ {
+		for j := 0; j < 6; j++ {
+			k[i][j] = k0[i][j]
+		}
+	}
+
+	rowFactor := []float64{axialFactor, shearFactor, js.Ktheta, axialFactor, shearFactor, je.Ktheta}
+	colFactor := []float64{axialFactor, shearFactor, js.Ktheta, axialFactor, shearFactor, je.Ktheta}
+	for i := 0; i < 6; i++ {
+		for j := 0; j < 6; j++ {
+			avg := math.Sqrt(rowFactor[i] * colFactor[j])
+			k[i][j] *= avg
+		}
+	}
+
+	k[2][2] = k1
+	k[5][5] = k4
+	k[2][5] = k0[2][5] * math.Sqrt(js.Ktheta*je.Ktheta)
+	k[5][2] = k[2][5]
+
+	return k
+}
+
 func (m *Member) TransformationMatrix() [6][6]float64 {
 	c := math.Cos(m.Angle)
 	s := math.Sin(m.Angle)
@@ -118,7 +256,12 @@ func (m *Member) TransformationMatrix() [6][6]float64 {
 }
 
 func (m *Member) GlobalStiffness() [6][6]float64 {
-	kLocal := m.LocalStiffness()
+	var kLocal [6][6]float64
+	if m.Start.Joint.Type != m.End.Joint.Type || m.Start.Joint.Type == "" {
+		kLocal = m.LocalStiffnessSemiRigid()
+	} else {
+		kLocal = m.LocalStiffnessSemiRigid()
+	}
 	T := m.TransformationMatrix()
 	var kGlobal [6][6]float64
 
@@ -158,6 +301,52 @@ func (ts *TrussStructure) AssembleStiffness() {
 			for j := 0; j < 6; j++ {
 				ts.K[indices[i]][indices[j]] += kGlobal[i][j]
 			}
+		}
+	}
+
+	if ts.useSemiRigid {
+		ts.assembleNodeSprings()
+	}
+}
+
+func (ts *TrussStructure) assembleNodeSprings() {
+	for _, node := range ts.Nodes {
+		if node.FixedR && node.FixedX && node.FixedY {
+			continue
+		}
+		nodeIdx := (node.ID - 1) * 3
+
+		connectedMembers := 0
+		totalEIL := 0.0
+		for _, member := range ts.Members {
+			if member.Start.ID == node.ID || member.End.ID == node.ID {
+				connectedMembers++
+				if member.I > 0 {
+					totalEIL += member.E * member.I / member.Length
+				}
+			}
+		}
+		if connectedMembers == 0 {
+			continue
+		}
+
+		if !node.FixedX && node.KshearX > 0 {
+			ts.K[nodeIdx][nodeIdx] += node.KshearX
+		}
+		if !node.FixedY && node.KshearY > 0 {
+			ts.K[nodeIdx+1][nodeIdx+1] += node.KshearY
+		}
+
+		ktheta := node.Ktheta
+		if ktheta == 0 && node.Joint.Ktheta > 0 {
+			ktheta = node.Joint.Ktheta * totalEIL * 0.1
+			if ktheta < 0 {
+				ktheta = 0
+			}
+		}
+
+		if !node.FixedR && ktheta > 0 {
+			ts.K[nodeIdx+2][nodeIdx+2] += ktheta
 		}
 	}
 }
