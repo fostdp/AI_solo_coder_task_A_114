@@ -1,0 +1,101 @@
+# 木材力学参数 (MPa)
+wood_mechanics:
+  elastic_modulus: 10000.0
+  allowable_stress_default: 8.5
+  poissons_ratio: 0.33
+
+# 构件截面参数 (m, m^2, m^4)
+member_sections:
+  arch_rib:
+    area: 0.12
+    inertia: 0.0015
+  deck_beam:
+    area: 0.08
+    inertia: 0.0008
+  vertical_post:
+    area: 0.06
+    inertia: 0.0004
+  diagonal_brace:
+    area: 0.042
+    inertia: 0.0002
+  transverse_tie:
+    area: 0.035
+    inertia: 0.00015
+
+# 榫卯节点半刚性系数 (0-1, 1=刚接)
+joint_stiffness:
+  mortise_tenon:
+    ktheta: 0.65
+    kt: 0.80
+    kaxial: 0.90
+  dovetail:
+    ktheta: 0.75
+    kt: 0.85
+    kaxial: 0.70
+  lap:
+    ktheta: 0.55
+    kt: 0.60
+    kaxial: 0.50
+  rigid:
+    ktheta: 1.00
+    kt: 1.00
+    kaxial: 1.00
+  pin:
+    ktheta: 0.02
+    kt: 0.95
+    kaxial: 0.98
+
+# 拱桥几何参数
+arch_geometry:
+  default_segments: 10
+  node_spring_scale: 0.1
+  stress_ratio_warning: 0.8
+  stress_ratio_danger: 1.0
+
+# 随机森林超参数
+random_forest:
+  species:
+    num_trees: 80
+    max_depth: 4
+    min_samples: 5
+    feature_ratio: 0.7
+  grade:
+    num_trees: 80
+    max_depth: 4
+    min_samples: 5
+    feature_ratio: 0.7
+
+# MQTT告警配置
+mqtt:
+  max_offline_queue: 10000
+  max_retry_attempts: 5
+  initial_retry_delay_sec: 1
+  persistence_file: "mqtt_offline_alerts.gob"
+
+# 传感器配置
+sensor:
+  quality_flag_good: 0
+  quality_flag_suspect: 1
+  quality_flag_bad: 2
+  default_sampling_interval_sec: 3600
+
+# 告警阈值
+alert_thresholds:
+  stress_warning_ratio: 0.8
+  stress_danger_ratio: 1.0
+  sensor_overrange_multiplier: 1.2
+  sensor_underrange_multiplier: 0.8
+
+# 车辆荷载 (kN)
+vehicle_loads:
+  pedestrian: 5.0
+  ox_cart: 30.0
+  horse_cart: 50.0
+  military_carts: 80.0
+  imperial_ceremony: 120.0
+
+# 营造法式规范
+yingzao_fashi:
+  default_max_span_ratio: 12.0
+  default_min_section_modulus: 300.0
+  default_safety_factor: 3.0
