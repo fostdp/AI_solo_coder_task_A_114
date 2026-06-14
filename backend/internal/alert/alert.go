@@ -1,9 +1,13 @@
 package alert
 
 import (
+	"container/list"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"sync"
 	"time"
 
 	"ancient-bridge-system/internal/config"
@@ -13,8 +17,29 @@ import (
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
+const (
+	maxOfflineQueueSize = 10000
+	maxRetryAttempts    = 5
+	initialRetryDelay   = 1 * time.Second
+	persistenceFile     = "mqtt_offline_alerts.gob"
+)
+
+type QueuedAlert struct {
+	Topic     string
+	Payload   []byte
+	AlertID   int
+	Attempts  int
+	NextRetry time.Time
+}
+
 type AlertService struct {
-	client mqtt.Client
+	client       mqtt.Client
+	offlineQueue *list.List
+	queueMutex   sync.Mutex
+	retryTicker  *time.Ticker
+	stopRetry    chan struct{}
+	connected    bool
+	connectedMu  sync.RWMutex
 }
 
 type AlertMessage struct {
@@ -39,12 +64,18 @@ func InitAlertService() {
 }
 
 func NewAlertService() *AlertService {
-	service := &AlertService{}
+	service := &AlertService{
+		offlineQueue: list.New(),
+		stopRetry:    make(chan struct{}),
+	}
+
+	service.loadPersistedQueue()
 
 	opts := mqtt.NewClientOptions()
 	brokerURL := fmt.Sprintf("tcp://%s:%d", config.AppConfig.MQTTBroker, config.AppConfig.MQTTPort)
 	opts.AddBroker(brokerURL)
 	opts.SetClientID(config.AppConfig.MQTTClientID)
+	opts.SetCleanSession(false)
 
 	if config.AppConfig.MQTTUsername != "" {
 		opts.SetUsername(config.AppConfig.MQTTUsername)
@@ -54,12 +85,27 @@ func NewAlertService() *AlertService {
 	}
 
 	opts.SetAutoReconnect(true)
+	opts.SetConnectRetry(true)
+	opts.SetConnectRetryInterval(2 * time.Second)
+	opts.SetMaxReconnectInterval(30 * time.Second)
+	opts.SetKeepAlive(30 * time.Second)
+	opts.SetPingTimeout(10 * time.Second)
+	opts.SetWriteTimeout(10 * time.Second)
+	opts.SetMessageChannelDepth(256)
+
 	opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
-		log.Printf("MQTT connection lost: %v", err)
+		log.Printf("MQTT connection lost: %v, buffering alerts in offline queue", err)
+		service.setConnected(false)
 	})
 
 	opts.SetOnConnectHandler(func(c mqtt.Client) {
-		log.Println("MQTT client connected successfully")
+		log.Println("MQTT client reconnected, flushing offline queue")
+		service.setConnected(true)
+		go service.flushOfflineQueue()
+	})
+
+	opts.SetReconnectingHandler(func(c mqtt.Client, o *mqtt.ClientOptions) {
+		log.Printf("MQTT attempting reconnect to %v", o.Servers)
 	})
 
 	client := mqtt.NewClient(opts)
@@ -67,14 +113,222 @@ func NewAlertService() *AlertService {
 
 	go func() {
 		token := client.Connect()
-		if token.Wait() && token.Error() != nil {
-			log.Printf("Failed to connect to MQTT broker: %v, alert service will work in degraded mode", token.Error())
+		if token.WaitTimeout(10*time.Second) && token.Error() != nil {
+			log.Printf("Failed to connect to MQTT broker: %v, alert service will buffer locally", token.Error())
+			service.setConnected(false)
 		} else {
 			log.Println("MQTT alert service initialized")
+			service.setConnected(true)
+			go service.flushOfflineQueue()
 		}
 	}()
 
+	service.retryTicker = time.NewTicker(5 * time.Second)
+	go service.retryLoop()
+
 	return service
+}
+
+func (as *AlertService) setConnected(v bool) {
+	as.connectedMu.Lock()
+	defer as.connectedMu.Unlock()
+	as.connected = v
+}
+
+func (as *AlertService) isConnected() bool {
+	as.connectedMu.RLock()
+	defer as.connectedMu.RUnlock()
+	return as.connected && as.client != nil && as.client.IsConnected()
+}
+
+func (as *AlertService) enqueueAlert(topic string, payload []byte, alertID int) {
+	as.queueMutex.Lock()
+	defer as.queueMutex.Unlock()
+
+	if as.offlineQueue.Len() >= maxOfflineQueueSize {
+		front := as.offlineQueue.Front()
+		if front != nil {
+			as.offlineQueue.Remove(front)
+			log.Printf("Offline queue full, dropped oldest alert")
+		}
+	}
+
+	as.offlineQueue.PushBack(&QueuedAlert{
+		Topic:     topic,
+		Payload:   payload,
+		AlertID:   alertID,
+		Attempts:  0,
+		NextRetry: time.Now(),
+	})
+	log.Printf("Alert %d enqueued offline (queue size: %d)", alertID, as.offlineQueue.Len())
+}
+
+func (as *AlertService) flushOfflineQueue() {
+	as.queueMutex.Lock()
+	if as.offlineQueue.Len() == 0 {
+		as.queueMutex.Unlock()
+		return
+	}
+
+	batch := make([]*QueuedAlert, 0, as.offlineQueue.Len())
+	for e := as.offlineQueue.Front(); e != nil; e = e.Next() {
+		if qa, ok := e.Value.(*QueuedAlert); ok {
+			batch = append(batch, qa)
+		}
+	}
+	as.offlineQueue.Init()
+	as.queueMutex.Unlock()
+
+	log.Printf("Flushing %d buffered alerts to MQTT", len(batch))
+
+	sentCount := 0
+	failedCount := 0
+	for _, qa := range batch {
+		if !as.isConnected() {
+			as.enqueueAlertDirect(qa)
+			failedCount++
+			continue
+		}
+		token := as.client.Publish(qa.Topic, 1, false, qa.Payload)
+		if token.WaitTimeout(5*time.Second) && token.Error() != nil {
+			qa.Attempts++
+			log.Printf("Failed to flush alert %d (attempt %d): %v", qa.AlertID, qa.Attempts, token.Error())
+			if qa.Attempts < maxRetryAttempts {
+				delay := initialRetryDelay * time.Duration(1<<uint(qa.Attempts-1))
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
+				}
+				qa.NextRetry = time.Now().Add(delay)
+				as.enqueueAlertDirect(qa)
+			} else {
+				log.Printf("Alert %d exceeded max retries (%d), discarded", qa.AlertID, maxRetryAttempts)
+			}
+			failedCount++
+		} else {
+			sentCount++
+		}
+	}
+	log.Printf("Flush complete: sent=%d, remaining=%d", sentCount, failedCount)
+}
+
+func (as *AlertService) enqueueAlertDirect(qa *QueuedAlert) {
+	as.queueMutex.Lock()
+	defer as.queueMutex.Unlock()
+	if as.offlineQueue.Len() < maxOfflineQueueSize {
+		as.offlineQueue.PushBack(qa)
+	}
+}
+
+func (as *AlertService) retryLoop() {
+	for {
+		select {
+		case <-as.retryTicker.C:
+			if as.isConnected() {
+				go as.retryDueAlerts()
+			}
+		case <-as.stopRetry:
+			return
+		}
+	}
+}
+
+func (as *AlertService) retryDueAlerts() {
+	as.queueMutex.Lock()
+	now := time.Now()
+	due := make([]*QueuedAlert, 0)
+	remaining := list.New()
+	for e := as.offlineQueue.Front(); e != nil; e = e.Next() {
+		if qa, ok := e.Value.(*QueuedAlert); ok {
+			if qa.NextRetry.Before(now) || qa.NextRetry.Equal(now) {
+				due = append(due, qa)
+			} else {
+				remaining.PushBack(qa)
+			}
+		}
+	}
+	as.offlineQueue = remaining
+	as.queueMutex.Unlock()
+
+	if len(due) == 0 {
+		return
+	}
+
+	log.Printf("Retrying %d due alerts", len(due))
+	for _, qa := range due {
+		if !as.isConnected() {
+			as.enqueueAlertDirect(qa)
+			continue
+		}
+		token := as.client.Publish(qa.Topic, 1, false, qa.Payload)
+		if token.WaitTimeout(5*time.Second) && token.Error() != nil {
+			qa.Attempts++
+			if qa.Attempts < maxRetryAttempts {
+				delay := initialRetryDelay * time.Duration(1<<uint(qa.Attempts-1))
+				if delay > 30*time.Second {
+					delay = 30 * time.Second
+				}
+				qa.NextRetry = time.Now().Add(delay)
+				as.enqueueAlertDirect(qa)
+			} else {
+				log.Printf("Alert %d exceeded max retries, discarded", qa.AlertID)
+			}
+		}
+	}
+}
+
+func (as *AlertService) persistQueue() {
+	as.queueMutex.Lock()
+	defer as.queueMutex.Unlock()
+
+	if as.offlineQueue.Len() == 0 {
+		os.Remove(persistenceFile)
+		return
+	}
+
+	items := make([]*QueuedAlert, 0, as.offlineQueue.Len())
+	for e := as.offlineQueue.Front(); e != nil; e = e.Next() {
+		if qa, ok := e.Value.(*QueuedAlert); ok {
+			items = append(items, qa)
+		}
+	}
+
+	f, err := os.Create(persistenceFile)
+	if err != nil {
+		log.Printf("Failed to persist offline queue: %v", err)
+		return
+	}
+	defer f.Close()
+
+	enc := gob.NewEncoder(f)
+	if err := enc.Encode(items); err != nil {
+		log.Printf("Failed to encode offline queue: %v", err)
+	} else {
+		log.Printf("Persisted %d alerts to disk", len(items))
+	}
+}
+
+func (as *AlertService) loadPersistedQueue() {
+	f, err := os.Open(persistenceFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Failed to open persisted queue: %v", err)
+		}
+		return
+	}
+	defer f.Close()
+
+	var items []*QueuedAlert
+	dec := gob.NewDecoder(f)
+	if err := dec.Decode(&items); err != nil {
+		log.Printf("Failed to decode persisted queue: %v", err)
+		return
+	}
+
+	for _, qa := range items {
+		as.offlineQueue.PushBack(qa)
+	}
+	log.Printf("Loaded %d persisted alerts from disk", len(items))
+	os.Remove(persistenceFile)
 }
 
 func (as *AlertService) CheckAndAlertMemberStress(bridgeID int, memberID int, stressRatio float64, measuredValue float64, thresholdValue float64, memberCode string) error {
@@ -196,11 +450,6 @@ func (as *AlertService) CheckAndAlertSensor(sensor *models.Sensor, value float64
 }
 
 func (as *AlertService) publishAlert(alert *models.Alert) {
-	if as.client == nil || !as.client.IsConnected() {
-		log.Println("MQTT client not connected, skipping alert publish")
-		return
-	}
-
 	alertMsg := AlertMessage{
 		AlertID:        alert.AlertID,
 		BridgeID:       alert.BridgeID,
@@ -221,11 +470,17 @@ func (as *AlertService) publishAlert(alert *models.Alert) {
 
 	topic := fmt.Sprintf("%s/%d/%s", config.AppConfig.MQTTTopic, alert.BridgeID, alert.AlertLevel)
 
+	if !as.isConnected() {
+		log.Printf("MQTT not connected, buffering alert %d", alert.AlertID)
+		as.enqueueAlert(topic, payload, alert.AlertID)
+		return
+	}
+
 	token := as.client.Publish(topic, 1, false, payload)
 	go func() {
-		token.Wait()
-		if token.Error() != nil {
-			log.Printf("Failed to publish alert: %v", token.Error())
+		if token.WaitTimeout(5*time.Second) && token.Error() != nil {
+			log.Printf("Failed to publish alert %d: %v, buffering", alert.AlertID, token.Error())
+			as.enqueueAlert(topic, payload, alert.AlertID)
 		}
 	}()
 }
@@ -279,8 +534,15 @@ func (as *AlertService) GetActiveAlerts(bridgeID int) ([]models.Alert, error) {
 }
 
 func (as *AlertService) Close() {
+	close(as.stopRetry)
+	if as.retryTicker != nil {
+		as.retryTicker.Stop()
+	}
+
+	as.persistQueue()
+
 	if as.client != nil && as.client.IsConnected() {
-		as.client.Disconnect(250)
+		as.client.Disconnect(500)
 		log.Println("MQTT alert service disconnected")
 	}
 }
