@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>古代木拱桥结构力学仿真与数字化复原系统</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div class="app-container">
+        <header class="app-header">
+            <div class="header-left">
+                <h1>古代木拱桥结构力学仿真与数字化复原系统</h1>
+                <p class="subtitle">基于《清明上河图》汴水虹桥等古桥的结构力学研究平台</p>
+            </div>
+            <div class="header-right">
+                <select id="bridgeSelector" class="bridge-select">
+                    <option value="1">汴水虹桥 (北宋)</option>
+                    <option value="2">永安桥 (南宋)</option>
+                    <option value="3">龙津桥 (明代)</option>
+                    <option value="4">广济桥 (宋代)</option>
+                    <option value="5">万安桥 (北宋)</option>
+                    <option value="6">飞虹桥 (清代)</option>
+                    <option value="7">千乘桥 (明代)</option>
+                    <option value="8">安澜桥 (宋代)</option>
+                    <option value="9">枫桥 (唐代)</option>
+                    <option value="10">灞桥 (唐代)</option>
+                </select>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <aside class="sidebar">
+                <div class="sidebar-section">
+                    <h3>导航菜单</h3>
+                    <nav class="nav-menu">
+                        <a href="#" class="nav-item active" data-view="model">三维模型</a>
+                        <a href="#" class="nav-item" data-view="analysis">结构分析</a>
+                        <a href="#" class="nav-item" data-view="moving">移动荷载</a>
+                        <a href="#" class="nav-item" data-view="craft">工艺反演</a>
+                        <a href="#" class="nav-item" data-view="sensors">传感器监测</a>
+                        <a href="#" class="nav-item" data-view="alerts">告警管理</a>
+                    </nav>
+                </div>
+
+                <div class="sidebar-section" id="modelControls">
+                    <h3>显示控制</h3>
+                    <div class="control-group">
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="showMembers" checked>
+                            <span>显示拱肋构件</span>
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="showDeck" checked>
+                            <span>显示桥面</span>
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="showNodes" checked>
+                            <span>显示节点</span>
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="showForces">
+                            <span>显示内力着色</span>
+                        </label>
+                        <label class="checkbox-label">
+                            <input type="checkbox" id="showDeformation">
+                            <span>显示变形放大</span>
+                        </label>
+                    </div>
+                    <div class="control-group">
+                        <label>变形放大系数</label>
+                        <input type="range" id="deformationScale" min="1" max="100" value="10">
+                        <span class="range-value" id="deformationValue">10x</span>
+                    </div>
+                    <div class="control-group">
+                        <label>视角控制</label>
+                        <button class="btn btn-sm" onclick="bridgeView.setTopView()">俯视图</button>
+                        <button class="btn btn-sm" onclick="bridgeView.setSideView()">侧视图</button>
+                        <button class="btn btn-sm" onclick="bridgeView.setFrontView()">正视图</button>
+                        <button class="btn btn-sm" onclick="bridgeView.setIsoView()">轴测图</button>
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="analysisControls" style="display:none;">
+                    <h3>静载分析</h3>
+                    <div class="control-group">
+                        <label>荷载类型</label>
+                        <select id="loadType">
+                            <option value="point">集中荷载</option>
+                            <option value="uniform">均布荷载</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label>荷载大小 (kN)</label>
+                        <input type="number" id="loadValue" value="50" min="1" max="500">
+                    </div>
+                    <div class="control-group">
+                        <label>荷载位置 (m)</label>
+                        <input type="range" id="loadPosition" min="0" max="100" value="50">
+                        <span class="range-value" id="positionValue">跨中</span>
+                    </div>
+                    <button class="btn btn-primary btn-full" onclick="runStaticAnalysis()">
+                        运行静载分析
+                    </button>
+                </div>
+
+                <div class="sidebar-section" id="movingControls" style="display:none;">
+                    <h3>移动荷载</h3>
+                    <div class="control-group">
+                        <label>车辆类型</label>
+                        <select id="vehicleType">
+                            <option value="5">宋代牛车 (5吨)</option>
+                            <option value="3.5">宋代马车 (3.5吨)</option>
+                            <option value="0.8">人力独轮车 (0.8吨)</option>
+                            <option value="12">重型货车 (12吨)</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label>分析步数</label>
+                        <input type="number" id="movingSteps" value="20" min="5" max="50">
+                    </div>
+                    <button class="btn btn-primary btn-full" onclick="runMovingAnalysis()">
+                        运行移动荷载分析
+                    </button>
+                    <button class="btn btn-full" onclick="playMovingAnimation()" id="playBtn">
+                        ▶ 播放动画
+                    </button>
+                    <div class="control-group">
+                        <label>动画速度</label>
+                        <input type="range" id="animSpeed" min="0.5" max="3" step="0.5" value="1">
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="craftControls" style="display:none;">
+                    <h3>工艺反演</h3>
+                    <div class="control-group">
+                        <label>木材种类</label>
+                        <select id="woodSpecies">
+                            <option value="杉木">杉木</option>
+                            <option value="松木">松木</option>
+                            <option value="柏木">柏木</option>
+                            <option value="樟木">樟木</option>
+                            <option value="楠木">楠木</option>
+                            <option value="黄花梨">黄花梨</option>
+                            <option value="紫檀">紫檀</option>
+                        </select>
+                    </div>
+                    <div class="control-group">
+                        <label>工艺水平</label>
+                        <input type="range" id="craftLevel" min="1" max="5" value="3">
+                        <span class="range-value" id="craftLevelValue">★★★☆☆</span>
+                    </div>
+                    <button class="btn btn-primary btn-full" onclick="runCraftAnalysis()">
+                        推断工艺方案
+                    </button>
+                </div>
+
+                <div class="sidebar-section" id="sensorControls" style="display:none;">
+                    <h3>传感器信息</h3>
+                    <div id="sensorList" class="sensor-list">
+                    </div>
+                </div>
+
+                <div class="sidebar-section" id="alertControls" style="display:none;">
+                    <h3>告警信息</h3>
+                    <div id="alertList" class="alert-list">
+                    </div>
+                </div>
+            </aside>
+
+            <main class="content-area">
+                <div class="canvas-container" id="canvasContainer">
+                    <canvas id="bridgeCanvas"></canvas>
+                    <div class="canvas-overlay">
+                        <div class="info-panel" id="bridgeInfo">
+                            <h4 id="bridgeName">汴水虹桥</h4>
+                            <div class="info-row"><span>朝代:</span><strong id="bridgeDynasty">北宋</strong></div>
+                            <div class="info-row"><span>跨度:</span><strong id="bridgeSpan">25.6 m</strong></div>
+                            <div class="info-row"><span>矢高:</span><strong id="bridgeRise">5.8 m</strong></div>
+                            <div class="info-row"><span>桥宽:</span><strong id="bridgeWidth">6.5 m</strong></div>
+                        </div>
+                        <div class="legend-panel" id="legendPanel" style="display:none;">
+                            <h4>应力图例</h4>
+                            <div class="legend-gradient"></div>
+                            <div class="legend-labels">
+                                <span>受压</span>
+                                <span>0</span>
+                                <span>受拉</span>
+                            </div>
+                            <div class="legend-scale">
+                                <span id="stressMin">-10 MPa</span>
+                                <span id="stressMax">10 MPa</span>
+                            </div>
+                        </div>
+                        <div class="stats-panel" id="statsPanel" style="display:none;">
+                            <h4>分析结果</h4>
+                            <div class="stat-item">
+                                <span class="stat-label">最大应力比</span>
+                                <span class="stat-value" id="maxStressRatio">0.00</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">最大位移</span>
+                                <span class="stat-value" id="maxDisplacement">0.00 mm</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">构件数量</span>
+                                <span class="stat-value" id="memberCount">0</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">节点数量</span>
+                                <span class="stat-value" id="nodeCount">0</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="data-panel" id="dataPanel">
+                    <div class="data-tabs">
+                        <button class="tab-btn active" data-tab="forces">构件内力</button>
+                        <button class="tab-btn" data-tab="displacements">节点位移</button>
+                        <button class="tab-btn" data-tab="compare">营造法式对比</button>
+                    </div>
+                    <div class="tab-content">
+                        <div class="tab-pane active" id="tab-forces">
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>构件编号</th>
+                                            <th>类型</th>
+                                            <th>轴力 (kN)</th>
+                                            <th>剪力 (kN)</th>
+                                            <th>弯矩 (kN·m)</th>
+                                            <th>应力 (MPa)</th>
+                                            <th>应力比</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="forcesTableBody">
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="tab-pane" id="tab-displacements">
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>节点编号</th>
+                                            <th>X位移 (mm)</th>
+                                            <th>Y位移 (mm)</th>
+                                            <th>总位移 (mm)</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="displacementsTableBody">
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="tab-pane" id="tab-compare">
+                            <div class="table-container">
+                                <table class="data-table">
+                                    <thead>
+                                        <tr>
+                                            <th>构件编号</th>
+                                            <th>类型</th>
+                                            <th>实际应力</th>
+                                            <th>容许应力</th>
+                                            <th>应力比</th>
+                                            <th>高跨比</th>
+                                            <th>合规性</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody id="compareTableBody">
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <footer class="app-footer">
+            <p>古代木拱桥结构力学仿真与数字化复原系统 | 基于杆系有限元法 | 与《营造法式》规范对比</p>
+        </footer>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.157.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="js/bridge3d.js"></script>
+    <script src="js/analysis.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
