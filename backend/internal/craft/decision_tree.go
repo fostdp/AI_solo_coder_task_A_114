@@ -2,6 +2,52 @@ package craft
 
 import (
 	"math"
+	"math/rand"
+	"sort"
+	"sync"
+	"time"
+)
+
+type WoodFeature struct {
+	GrainDensity    float64 `json:"grain_density"`
+	GrainAngle      float64 `json:"grain_angle"`
+	LatewoodRatio   float64 `json:"latewood_ratio"`
+	KnotsCount      float64 `json:"knots_count"`
+	AverageKnotSize float64 `json:"average_knot_size"`
+	Density         float64 `json:"density"`
+	Hardness        float64 `json:"hardness"`
+	ColorR          int     `json:"color_r"`
+	ColorG          int     `json:"color_g"`
+	ColorB          int     `json:"color_b"`
+}
+
+type JoineryFeature struct {
+	JointType           string  `json:"joint_type"`
+	TenonLength         float64 `json:"tenon_length"`
+	TenonWidth          float64 `json:"tenon_width"`
+	TenonThickness      float64 `json:"tenon_thickness"`
+	MortiseDepth        float64 `json:"mortise_depth"`
+	ShoulderAngle       float64 `json:"shoulder_angle"`
+	FitTolerance        float64 `json:"fit_tolerance"`
+	WoodSpecies         string  `json:"wood_species"`
+	CraftsmanshipRating float64 `json:"craftsmanship_rating"`
+}
+
+type CraftAnalysisResult struct {
+	WoodSpecies          string              `json:"wood_species"`
+	WoodGrade            string              `json:"wood_grade"`
+	ConstructionSequence []string            `json:"construction_sequence"`
+	JoineryType          string              `json:"joinery_type"`
+	ConfidenceScore      float64             `json:"confidence_score"`
+	FeatureImportance    map[string]float64  `json:"feature_importance"`
+	MethodUsed           string              `json:"method_used"`
+}
+
+const (
+	defaultMaxDepth     = 4
+	defaultNumTrees     = 100
+	defaultMinSamples   = 5
+	defaultFeatureRatio = 0.7
 )
 
 type DecisionTreeNode struct {
@@ -13,276 +59,595 @@ type DecisionTreeNode struct {
 	Prediction   string
 	Confidence   float64
 	Samples      int
+	Depth        int
+	ClassCounts  map[string]int
+	OOBError     float64
 }
 
-type WoodFeature struct {
-	GrainDensity    float64
-	GrainAngle      float64
-	LatewoodRatio   float64
-	KnotsCount      float64
-	AverageKnotSize float64
-	Density         float64
-	Hardness        float64
-	ColorR          float64
-	ColorG          float64
-	ColorB          float64
+type RandomForest struct {
+	Trees         []*DecisionTreeNode
+	NumTrees      int
+	MaxDepth      int
+	MinSamples    int
+	FeatureRatio  float64
+	FeatureNames  []string
+	Importance    map[string]float64
+	Labels        []string
+	trainMutex    sync.Mutex
 }
 
-type JoineryFeature struct {
-	JointType           string
-	TenonLength         float64
-	TenonWidth          float64
-	TenonThickness      float64
-	MortiseDepth        float64
-	ShoulderAngle       float64
-	FitTolerance        float64
-	WoodSpecies         string
-	CraftsmanshipRating float64
+type DataSample struct {
+	Features []float64
+	Label    string
+	Weight   float64
 }
 
-type CraftAnalysisResult struct {
-	WoodSpecies          string
-	WoodGrade            string
-	ConstructionSequence []string
-	JoineryType          string
-	ConfidenceScore      float64
-	FeatureImportance    map[string]float64
-	MethodUsed           string
-}
+func NewRandomForest(numTrees, maxDepth int, featureNames []string) *RandomForest {
+	if numTrees <= 0 {
+		numTrees = defaultNumTrees
+	}
+	if maxDepth <= 0 {
+		maxDepth = defaultMaxDepth
+	}
 
-type WoodSpeciesDecisionTree struct {
-	Root *DecisionTreeNode
-}
+	rand.Seed(time.Now().UnixNano())
 
-func NewWoodSpeciesTree() *WoodSpeciesDecisionTree {
-	return &WoodSpeciesDecisionTree{
-		Root: buildWoodSpeciesTree(),
+	return &RandomForest{
+		Trees:         make([]*DecisionTreeNode, 0, numTrees),
+		NumTrees:      numTrees,
+		MaxDepth:      maxDepth,
+		MinSamples:    defaultMinSamples,
+		FeatureRatio:  defaultFeatureRatio,
+		FeatureNames:  featureNames,
+		Importance:    make(map[string]float64),
 	}
 }
 
-func buildWoodSpeciesTree() *DecisionTreeNode {
-	root := &DecisionTreeNode{
-		FeatureIndex: 5,
-		Threshold:    0.65,
-		Samples:      1000,
+func (rf *RandomForest) Train(samples []DataSample) {
+	rf.Labels = extractUniqueLabels(samples)
+
+	var wg sync.WaitGroup
+	wg.Add(rf.NumTrees)
+
+	treeChan := make(chan *DecisionTreeNode, rf.NumTrees)
+
+	for t := 0; t < rf.NumTrees; t++ {
+		go func(treeIdx int) {
+			defer wg.Done()
+
+			bootstrap := bootstrapSample(samples, len(samples))
+			oobIdx := getOOBIndices(samples, bootstrap)
+
+			numFeatures := int(math.Max(1, float64(len(bootstrap[0].Features))*rf.FeatureRatio))
+
+			tree := rf.buildTree(bootstrap, 0, numFeatures)
+			tree.OOBError = rf.calculateOOBError(tree, samples, oobIdx)
+
+			treeChan <- tree
+		}(t)
 	}
 
-	highDensity := &DecisionTreeNode{
-		FeatureIndex: 2,
-		Threshold:    0.45,
-		Samples:      400,
+	wg.Wait()
+	close(treeChan)
+
+	for tree := range treeChan {
+		rf.Trees = append(rf.Trees, tree)
 	}
 
-	lowDensity := &DecisionTreeNode{
-		FeatureIndex: 6,
-		Threshold:    5.0,
-		Samples:      600,
-	}
-
-	root.Left = lowDensity
-	root.Right = highDensity
-
-	highDensityLeft := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "黄花梨",
-		Confidence: 0.85,
-		Samples:    150,
-	}
-
-	highDensityRight := &DecisionTreeNode{
-		FeatureIndex: 4,
-		Threshold:    1.5,
-		Samples:      250,
-	}
-
-	highDensity.Left = highDensityLeft
-	highDensity.Right = highDensityRight
-
-	highDensityRightLeft := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "紫檀",
-		Confidence: 0.90,
-		Samples:    100,
-	}
-
-	highDensityRightRight := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "铁力木",
-		Confidence: 0.78,
-		Samples:    150,
-	}
-
-	highDensityRight.Left = highDensityRightLeft
-	highDensityRight.Right = highDensityRightRight
-
-	lowDensityLeft := &DecisionTreeNode{
-		FeatureIndex: 0,
-		Threshold:    2.5,
-		Samples:      350,
-	}
-
-	lowDensityRight := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "樟木",
-		Confidence: 0.72,
-		Samples:    250,
-	}
-
-	lowDensity.Left = lowDensityLeft
-	lowDensity.Right = lowDensityRight
-
-	lowDensityLeftLeft := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "杉木",
-		Confidence: 0.88,
-		Samples:    200,
-	}
-
-	lowDensityLeftRight := &DecisionTreeNode{
-		FeatureIndex: 3,
-		Threshold:    5,
-		Samples:      150,
-	}
-
-	lowDensityLeft.Left = lowDensityLeftLeft
-	lowDensityLeft.Right = lowDensityLeftRight
-
-	lowDensityLeftRightLeft := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "松木",
-		Confidence: 0.82,
-		Samples:    80,
-	}
-
-	lowDensityLeftRightRight := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "柏木",
-		Confidence: 0.75,
-		Samples:    70,
-	}
-
-	lowDensityLeftRight.Left = lowDensityLeftRightLeft
-	lowDensityLeftRight.Right = lowDensityLeftRightRight
-
-	return root
+	rf.calculateFeatureImportance(samples)
 }
 
-func (t *WoodSpeciesDecisionTree) Predict(features *WoodFeature) (string, float64) {
-	node := t.Root
-	featureValues := []float64{
-		features.GrainDensity,
-		features.GrainAngle,
-		features.LatewoodRatio,
-		features.KnotsCount,
-		features.AverageKnotSize,
-		features.Density,
-		features.Hardness,
-		features.ColorR,
-		features.ColorG,
-		features.ColorB,
+func (rf *RandomForest) buildTree(samples []DataSample, depth int, numFeatures int) *DecisionTreeNode {
+	node := &DecisionTreeNode{
+		Depth:       depth,
+		Samples:     len(samples),
+		ClassCounts: countClassLabels(samples),
 	}
 
-	for !node.IsLeaf {
-		if featureValues[node.FeatureIndex] <= node.Threshold {
-			node = node.Left
-		} else {
-			node = node.Right
+	if len(samples) == 0 {
+		return nil
+	}
+
+	if depth >= rf.MaxDepth || len(samples) < rf.MinSamples || isPure(samples) {
+		node.IsLeaf = true
+		node.Prediction, node.Confidence = majorityVote(samples)
+		return node
+	}
+
+	bestFeat, bestThresh, bestGain := rf.findBestSplit(samples, numFeatures)
+
+	if bestGain < 1e-6 {
+		node.IsLeaf = true
+		node.Prediction, node.Confidence = majorityVote(samples)
+		return node
+	}
+
+	leftSamples, rightSamples := splitDataset(samples, bestFeat, bestThresh)
+
+	node.FeatureIndex = bestFeat
+	node.Threshold = bestThresh
+	node.Left = rf.buildTree(leftSamples, depth+1, numFeatures)
+	node.Right = rf.buildTree(rightSamples, depth+1, numFeatures)
+
+	return node
+}
+
+func (rf *RandomForest) findBestSplit(samples []DataSample, numFeatures int) (int, float64, float64) {
+	numAllFeatures := len(samples[0].Features)
+	featureIndices := randomFeatureIndices(numAllFeatures, numFeatures)
+
+	bestGain := -1.0
+	bestFeat := -1
+	bestThresh := 0.0
+
+	parentGini := weightedGini(samples)
+
+	for _, fi := range featureIndices {
+		thresholds := collectFeatureValues(samples, fi)
+		sort.Float64s(thresholds)
+		candidates := candidateThresholds(thresholds)
+
+		for _, thresh := range candidates {
+			left, right := splitDataset(samples, fi, thresh)
+
+			if len(left) == 0 || len(right) == 0 {
+				continue
+			}
+
+			childGini := weightedSplitGini(left, right)
+			gain := parentGini - childGini
+
+			if gain > bestGain {
+				bestGain = gain
+				bestFeat = fi
+				bestThresh = thresh
+			}
 		}
 	}
 
-	return node.Prediction, node.Confidence
+	return bestFeat, bestThresh, bestGain
 }
 
-type WoodGradeDecisionTree struct {
-	Root *DecisionTreeNode
-}
+func (rf *RandomForest) Predict(features []float64) (string, float64, map[string]float64) {
+	votes := make(map[string]float64)
+	totalWeight := 0.0
 
-func NewWoodGradeTree() *WoodGradeDecisionTree {
-	return &WoodGradeDecisionTree{
-		Root: buildWoodGradeTree(),
-	}
-}
-
-func buildWoodGradeTree() *DecisionTreeNode {
-	root := &DecisionTreeNode{
-		FeatureIndex: 3,
-		Threshold:    3,
-		Samples:      1000,
+	for _, tree := range rf.Trees {
+		pred, conf := predictTree(tree, features)
+		weight := 1.0 / (1.0 + tree.OOBError)
+		votes[pred] += conf * weight
+		totalWeight += weight
 	}
 
-	lowKnots := &DecisionTreeNode{
-		FeatureIndex: 2,
-		Threshold:    0.5,
-		Samples:      500,
+	for label := range votes {
+		votes[label] /= totalWeight
 	}
 
-	highKnots := &DecisionTreeNode{
-		FeatureIndex: 4,
-		Threshold:    2.0,
-		Samples:      500,
-	}
-
-	root.Left = lowKnots
-	root.Right = highKnots
-
-	lowKnotsLeft := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "一等材",
-		Confidence: 0.92,
-		Samples:    200,
-	}
-
-	lowKnotsRight := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "二等材",
-		Confidence: 0.85,
-		Samples:    300,
-	}
-
-	lowKnots.Left = lowKnotsLeft
-	lowKnots.Right = lowKnotsRight
-
-	highKnotsLeft := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "三等材",
-		Confidence: 0.78,
-		Samples:    250,
-	}
-
-	highKnotsRight := &DecisionTreeNode{
-		IsLeaf:     true,
-		Prediction: "等外材",
-		Confidence: 0.90,
-		Samples:    250,
-	}
-
-	highKnots.Left = highKnotsLeft
-	highKnots.Right = highKnotsRight
-
-	return root
-}
-
-func (t *WoodGradeDecisionTree) Predict(features *WoodFeature) (string, float64) {
-	node := t.Root
-	featureValues := []float64{
-		features.GrainDensity,
-		features.GrainAngle,
-		features.LatewoodRatio,
-		features.KnotsCount,
-		features.AverageKnotSize,
-		features.Density,
-		features.Hardness,
-	}
-
-	for !node.IsLeaf {
-		if featureValues[node.FeatureIndex] <= node.Threshold {
-			node = node.Left
-		} else {
-			node = node.Right
+	bestLabel := ""
+	bestProb := 0.0
+	for label, prob := range votes {
+		if prob > bestProb {
+			bestProb = prob
+			bestLabel = label
 		}
 	}
 
-	return node.Prediction, node.Confidence
+	return bestLabel, bestProb, votes
+}
+
+func predictTree(node *DecisionTreeNode, features []float64) (string, float64) {
+	if node == nil {
+		return "", 0.0
+	}
+
+	if node.IsLeaf {
+		return node.Prediction, node.Confidence
+	}
+
+	if features[node.FeatureIndex] <= node.Threshold {
+		return predictTree(node.Left, features)
+	}
+	return predictTree(node.Right, features)
+}
+
+func (rf *RandomForest) calculateOOBError(tree *DecisionTreeNode, samples []DataSample, oobIdx []int) float64 {
+	if len(oobIdx) == 0 {
+		return 0.5
+	}
+
+	correct := 0
+	for _, idx := range oobIdx {
+		s := samples[idx]
+		pred, _ := predictTree(tree, s.Features)
+		if pred == s.Label {
+			correct++
+		}
+	}
+
+	return 1.0 - float64(correct)/float64(len(oobIdx))
+}
+
+func (rf *RandomForest) calculateFeatureImportance(samples []DataSample) {
+	importance := make([]float64, len(rf.FeatureNames))
+
+	for _, tree := range rf.Trees {
+		importance += treePermutationImportance(tree, samples, importance)
+	}
+
+	for i, fi := range importance {
+		importance[i] = fi / float64(rf.NumTrees)
+		if i < len(rf.FeatureNames) {
+			rf.Importance[rf.FeatureNames[i]] = importance[i]
+		}
+	}
+
+	normalizeMap(rf.Importance)
+}
+
+func treePermutationImportance(tree *DecisionTreeNode, samples []DataSample, baseImp []float64) []float64 {
+	imp := make([]float64, len(baseImp))
+	if len(samples) == 0 {
+		return imp
+	}
+
+	baseCorrect := 0
+	for _, s := range samples {
+		pred, _ := predictTree(tree, s.Features)
+		if pred == s.Label {
+			baseCorrect++
+		}
+	}
+	baseAcc := float64(baseCorrect) / float64(len(samples))
+
+	for fi := 0; fi < len(imp); fi++ {
+		permuted := make([]DataSample, len(samples))
+		copy(permuted, samples)
+
+		permuteFeature(permuted, fi)
+
+		permCorrect := 0
+		for _, s := range permuted {
+			pred, _ := predictTree(tree, s.Features)
+			if pred == s.Label {
+				permCorrect++
+			}
+		}
+		permAcc := float64(permCorrect) / float64(len(samples))
+		imp[fi] = baseAcc - permAcc
+	}
+
+	return imp
+}
+
+func permuteFeature(samples []DataSample, featIdx int) {
+	values := make([]float64, len(samples))
+	for i, s := range samples {
+		values[i] = s.Features[featIdx]
+	}
+	rand.Shuffle(len(values), func(i, j int) {
+		values[i], values[j] = values[j], values[i]
+	})
+	for i := range samples {
+		samples[i].Features[featIdx] = values[i]
+	}
+}
+
+func extractUniqueLabels(samples []DataSample) []string {
+	labelSet := make(map[string]bool)
+	for _, s := range samples {
+		labelSet[s.Label] = true
+	}
+	labels := make([]string, 0, len(labelSet))
+	for l := range labelSet {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+func bootstrapSample(samples []DataSample, n int) []DataSample {
+	result := make([]DataSample, n)
+	for i := 0; i < n; i++ {
+		idx := rand.Intn(len(samples))
+		result[i] = samples[idx]
+	}
+	return result
+}
+
+func getOOBIndices(samples []DataSample, bootstrap []DataSample) []int {
+	sampleMap := make(map[int]bool)
+	for i := range bootstrap {
+		idx := rand.Intn(len(samples))
+		sampleMap[idx] = true
+	}
+
+	oob := make([]int, 0)
+	for i := range samples {
+		if !sampleMap[i] {
+			oob = append(oob, i)
+		}
+	}
+	return oob
+}
+
+func randomFeatureIndices(total, n int) []int {
+	indices := make([]int, total)
+	for i := range indices {
+		indices[i] = i
+	}
+	rand.Shuffle(len(indices), func(i, j int) {
+		indices[i], indices[j] = indices[j], indices[i]
+	})
+	if n > total {
+		n = total
+	}
+	return indices[:n]
+}
+
+func isPure(samples []DataSample) bool {
+	if len(samples) < 2 {
+		return true
+	}
+	label := samples[0].Label
+	for _, s := range samples[1:] {
+		if s.Label != label {
+			return false
+		}
+	}
+	return true
+}
+
+func countClassLabels(samples []DataSample) map[string]int {
+	counts := make(map[string]int)
+	for _, s := range samples {
+		counts[s.Label]++
+	}
+	return counts
+}
+
+func majorityVote(samples []DataSample) (string, float64) {
+	counts := countClassLabels(samples)
+	total := len(samples)
+	if total == 0 {
+		return "", 0.0
+	}
+
+	bestLabel := ""
+	bestCount := 0
+	for label, count := range counts {
+		if count > bestCount {
+			bestCount = count
+			bestLabel = label
+		}
+	}
+	return bestLabel, float64(bestCount) / float64(total)
+}
+
+func weightedGini(samples []DataSample) float64 {
+	counts := make(map[string]float64)
+	totalWeight := 0.0
+	for _, s := range samples {
+		w := s.Weight
+		if w == 0 {
+			w = 1.0
+		}
+		counts[s.Label] += w
+		totalWeight += w
+	}
+	if totalWeight == 0 {
+		return 0.0
+	}
+
+	gini := 1.0
+	for _, w := range counts {
+		p := w / totalWeight
+		gini -= p * p
+	}
+	return gini
+}
+
+func weightedSplitGini(left, right []DataSample) float64 {
+	nLeft := float64(len(left))
+	nRight := float64(len(right))
+	total := nLeft + nRight
+	if total == 0 {
+		return 0.0
+	}
+	return (nLeft/total)*weightedGini(left) + (nRight/total)*weightedGini(right)
+}
+
+func collectFeatureValues(samples []DataSample, featIdx int) []float64 {
+	values := make([]float64, len(samples))
+	for i, s := range samples {
+		values[i] = s.Features[featIdx]
+	}
+	return values
+}
+
+func candidateThresholds(values []float64) []float64 {
+	if len(values) < 2 {
+		return values
+	}
+	thresholds := make([]float64, 0)
+	seen := make(map[float64]bool)
+	for i := 0; i < len(values)-1; i++ {
+		if values[i] == values[i+1] {
+			continue
+		}
+		mid := (values[i] + values[i+1]) / 2.0
+		if !seen[mid] {
+			thresholds = append(thresholds, mid)
+			seen[mid] = true
+		}
+		if len(thresholds) > 20 {
+			break
+		}
+	}
+	if len(thresholds) == 0 {
+		thresholds = append(thresholds, values[0])
+	}
+	return thresholds
+}
+
+func splitDataset(samples []DataSample, featIdx int, threshold float64) ([]DataSample, []DataSample) {
+	left := make([]DataSample, 0)
+	right := make([]DataSample, 0)
+	for _, s := range samples {
+		if s.Features[featIdx] <= threshold {
+			left = append(left, s)
+		} else {
+			right = append(right, s)
+		}
+	}
+	return left, right
+}
+
+func normalizeMap(m map[string]float64) {
+	sum := 0.0
+	for _, v := range m {
+		sum += v
+	}
+	if sum == 0 {
+		return
+	}
+	for k, v := range m {
+		m[k] = v / sum
+	}
+}
+
+var speciesFeatureNames = []string{
+	"grain_density", "grain_angle", "latewood_ratio",
+	"knots_count", "average_knot_size", "density",
+	"hardness", "color_r", "color_g", "color_b",
+}
+
+var gradeFeatureNames = []string{
+	"knots_count", "average_knot_size", "latewood_ratio",
+	"density", "hardness", "grain_density",
+	"grain_angle", "color_r", "color_g", "color_b",
+}
+
+func woodFeaturesToVector(wf *WoodFeature) []float64 {
+	return []float64{
+		wf.GrainDensity, wf.GrainAngle, wf.LatewoodRatio,
+		wf.KnotsCount, wf.AverageKnotSize, wf.Density,
+		wf.Hardness, float64(wf.ColorR), float64(wf.ColorG), float64(wf.ColorB),
+	}
+}
+
+func addNoise(v float64, sigma float64) float64 {
+	return v + (rand.Float64()-0.5)*2*sigma
+}
+
+func buildSpeciesTrainingData() []DataSample {
+	samples := make([]DataSample, 0)
+	speciesList := []struct {
+		name   string
+		base   *WoodFeature
+		count  int
+		sigma  float64
+	}{
+		{"杉木", GenerateTypicalWoodFeatures("杉木"), 80, 0.08},
+		{"松木", GenerateTypicalWoodFeatures("松木"), 80, 0.10},
+		{"楠木", {
+			GrainDensity: 4.0, GrainAngle: 8.0, LatewoodRatio: 0.38,
+			KnotsCount: 1.5, AverageKnotSize: 0.6, Density: 0.61,
+			Hardness: 4.2, ColorR: 175, ColorG: 130, ColorB: 80,
+		}, 60, 0.08},
+		{"榆木", {
+			GrainDensity: 4.5, GrainAngle: 12.0, LatewoodRatio: 0.45,
+			KnotsCount: 3.0, AverageKnotSize: 1.0, Density: 0.68,
+			Hardness: 5.2, ColorR: 190, ColorG: 145, ColorB: 95,
+		}, 60, 0.10},
+		{"黄花梨", GenerateTypicalWoodFeatures("黄花梨"), 40, 0.06},
+		{"紫檀", GenerateTypicalWoodFeatures("紫檀"), 30, 0.05},
+		{"柞木", {
+			GrainDensity: 5.2, GrainAngle: 14.0, LatewoodRatio: 0.48,
+			KnotsCount: 2.5, AverageKnotSize: 0.9, Density: 0.76,
+			Hardness: 6.0, ColorR: 165, ColorG: 115, ColorB: 65,
+		}, 40, 0.08},
+	}
+
+	for _, sp := range speciesList {
+		for i := 0; i < sp.count; i++ {
+			fv := woodFeaturesToVector(sp.base)
+			for j := range fv {
+				scale := 1.0
+				if j >= 7 {
+					scale = 15.0
+				}
+				fv[j] = addNoise(fv[j], fv[j]*sp.sigma+scale*0.01)
+			}
+			samples = append(samples, DataSample{
+				Features: fv,
+				Label:    sp.name,
+				Weight:   1.0,
+			})
+		}
+	}
+	return samples
+}
+
+func buildGradeTrainingData() []DataSample {
+	samples := make([]DataSample, 0)
+	gradeDefs := []struct {
+		grade  string
+		knots  [2]float64
+		density [2]float64
+		latewood [2]float64
+		hardness [2]float64
+		count  int
+	}{
+		{"一等材", [2]float64{0, 2}, [2]float64{0.65, 1.1}, [2]float64{0.40, 0.65}, [2]float64{4.5, 9.0}, 80},
+		{"二等材", [2]float64{1, 4}, [2]float64{0.50, 0.75}, [2]float64{0.35, 0.50}, [2]float64{3.0, 5.5}, 100},
+		{"三等材", [2]float64{3, 7}, [2]float64{0.40, 0.58}, [2]float64{0.30, 0.43}, [2]float64{2.0, 4.0}, 100},
+		{"等外材", [2]float64{5, 12}, [2]float64{0.30, 0.48}, [2]float64{0.20, 0.38}, [2]float64{1.0, 3.0}, 80},
+	}
+
+	randBase := GenerateTypicalWoodFeatures("默认")
+	for _, gd := range gradeDefs {
+		for i := 0; i < gd.count; i++ {
+			wf := &WoodFeature{}
+			*wf = *randBase
+			wf.KnotsCount = gd.knots[0] + rand.Float64()*(gd.knots[1]-gd.knots[0])
+			wf.AverageKnotSize = 0.3 + wf.KnotsCount*0.15 + rand.Float64()*0.3
+			wf.Density = gd.density[0] + rand.Float64()*(gd.density[1]-gd.density[0])
+			wf.LatewoodRatio = gd.latewood[0] + rand.Float64()*(gd.latewood[1]-gd.latewood[0])
+			wf.Hardness = gd.hardness[0] + rand.Float64()*(gd.hardness[1]-gd.hardness[0])
+			wf.GrainDensity = addNoise(wf.Density*7, 0.5)
+			wf.GrainAngle = addNoise(10, 4)
+			wf.ColorR = addNoise(170, 15)
+			wf.ColorG = addNoise(140, 15)
+			wf.ColorB = addNoise(90, 15)
+			samples = append(samples, DataSample{
+				Features: woodFeaturesToVector(wf),
+				Label:    gd.grade,
+				Weight:   1.0,
+			})
+		}
+	}
+	return samples
+}
+
+var (
+	globalSpeciesRF *RandomForest
+	globalGradeRF   *RandomForest
+	initRFOnce      sync.Once
+)
+
+func initGlobalForests() {
+	initRFOnce.Do(func() {
+		speciesData := buildSpeciesTrainingData()
+		globalSpeciesRF = NewRandomForest(80, 4, speciesFeatureNames)
+		globalSpeciesRF.Train(speciesData)
+
+		gradeData := buildGradeTrainingData()
+		globalGradeRF = NewRandomForest(80, 4, gradeFeatureNames)
+		globalGradeRF.Train(gradeData)
+
+		logStr := "RandomForest initialized"
+		_ = logStr
+	})
 }
 
 type ConstructionSequenceInference struct {
@@ -427,11 +792,12 @@ func (jti *JoineryTypeInference) InferJoineryType() (string, float64) {
 }
 
 func AnalyzeCraft(woodFeatures *WoodFeature, joineryFeatures *JoineryFeature, bridgeType string) *CraftAnalysisResult {
-	speciesTree := NewWoodSpeciesTree()
-	gradeTree := NewWoodGradeTree()
+	initGlobalForests()
 
-	species, speciesConf := speciesTree.Predict(woodFeatures)
-	grade, gradeConf := gradeTree.Predict(woodFeatures)
+	featureVec := woodFeaturesToVector(woodFeatures)
+
+	species, speciesConf, _ := globalSpeciesRF.Predict(featureVec)
+	grade, gradeConf, _ := globalGradeRF.Predict(featureVec)
 
 	sequenceInference := &ConstructionSequenceInference{
 		BridgeType:   bridgeType,
@@ -453,14 +819,14 @@ func AnalyzeCraft(woodFeatures *WoodFeature, joineryFeatures *JoineryFeature, br
 
 	overallConfidence := (speciesConf + gradeConf + joineryConf) / 3.0
 
-	featureImportance := map[string]float64{
-		"density":            0.25,
-		"latewood_ratio":     0.20,
-		"knots_count":        0.18,
-		"hardness":           0.15,
-		"grain_density":      0.12,
-		"average_knot_size":  0.10,
+	combinedImportance := make(map[string]float64)
+	for k, v := range globalSpeciesRF.Importance {
+		combinedImportance[k] += v * 0.5
 	}
+	for k, v := range globalGradeRF.Importance {
+		combinedImportance[k] += v * 0.5
+	}
+	normalizeMap(combinedImportance)
 
 	return &CraftAnalysisResult{
 		WoodSpecies:          species,
@@ -468,8 +834,8 @@ func AnalyzeCraft(woodFeatures *WoodFeature, joineryFeatures *JoineryFeature, br
 		ConstructionSequence: sequence,
 		JoineryType:          joineryType,
 		ConfidenceScore:      overallConfidence,
-		FeatureImportance:    featureImportance,
-		MethodUsed:           "决策树分类 + 规则引擎",
+		FeatureImportance:    combinedImportance,
+		MethodUsed:           "随机森林(Random Forest, max_depth=4) + 规则引擎",
 	}
 }
 
@@ -535,52 +901,4 @@ func GenerateTypicalWoodFeatures(woodSpecies string) *WoodFeature {
 	}
 
 	return features
-}
-
-func CalculateGiniImpurity(labels []string) float64 {
-	counts := make(map[string]int)
-	for _, label := range labels {
-		counts[label]++
-	}
-
-	impurity := 1.0
-	total := float64(len(labels))
-	for _, count := range counts {
-		p := float64(count) / total
-		impurity -= p * p
-	}
-
-	return impurity
-}
-
-func CalculateInformationGain(labels []string, leftLabels, rightLabels []string) float64 {
-	parentGini := CalculateGiniImpurity(labels)
-	total := len(labels)
-	leftWeight := float64(len(leftLabels)) / float64(total)
-	rightWeight := float64(len(rightLabels)) / float64(total)
-
-	childGini := leftWeight*CalculateGiniImpurity(leftLabels) + rightWeight*CalculateGiniImpurity(rightLabels)
-
-	return parentGini - childGini
-}
-
-func CalculateEntropy(values []float64) float64 {
-	sum := 0.0
-	for _, v := range values {
-		sum += v
-	}
-
-	if sum == 0 {
-		return 0
-	}
-
-	entropy := 0.0
-	for _, v := range values {
-		if v > 0 {
-			p := v / sum
-			entropy -= p * math.Log2(p)
-		}
-	}
-
-	return entropy
 }
