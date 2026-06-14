@@ -1,74 +1,206 @@
-version: '3.8'
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-restart: &default-restart
+  unless-stopped
 
 services:
   timescaledb:
-    image: timescale/timescaledb:latest-pg15
+    image: timescale/timescaledb:2.13.0-pg15
     container_name: ancient-bridge-db
+    hostname: timescaledb
+    restart: *default-restart
     environment:
       POSTGRES_DB: ancient_bridges
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+      TIMESCALEDB_TELEMETRY: "off"
+      PG_SHARED_BUFFERS: 256MB
+      PG_WORK_MEM: 16MB
+      PG_EFFECTIVE_CACHE_SIZE: 1GB
+      TZ: Asia/Shanghai
     ports:
       - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./database/bridge_data.sql:/docker-entrypoint-initdb.d/02-bridge-data.sql:ro
+      - ./docker/timescaledb/compression.sql:/docker-entrypoint-initdb.d/03-compression.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ancient_bridges"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
+    logging: *default-logging
+    networks:
+      - bridge-net
 
   mqtt-broker:
-    image: eclipse-mosquitto:latest
+    image: eclipse-mosquitto:2.0.18
     container_name: ancient-bridge-mqtt
+    hostname: mqtt-broker
+    restart: *default-restart
+    environment:
+      TZ: Asia/Shanghai
     ports:
       - "1883:1883"
       - "9001:9001"
     volumes:
+      - ./docker/mosquitto/config/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - mqtt_data:/mosquitto/data
       - mqtt_log:/mosquitto/log
-    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -t 'test/health' -m 'ping' -q 0 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *default-logging
+    networks:
+      - bridge-net
 
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
     container_name: ancient-bridge-backend
-    ports:
-      - "8080:8080"
+    hostname: backend
+    restart: *default-restart
     environment:
-      SERVER_PORT: 8080
+      TZ: Asia/Shanghai
+      SERVER_PORT: "8080"
       DB_HOST: timescaledb
-      DB_PORT: 5432
+      DB_PORT: "5432"
       DB_USER: postgres
-      DB_PASSWORD: postgres
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
       DB_NAME: ancient_bridges
       DB_SSLMODE: disable
+      DB_CONN_MAX_OPEN: 50
+      DB_CONN_MAX_IDLE: 10
       MQTT_BROKER: mqtt-broker
-      MQTT_PORT: 1883
-      MQTT_CLIENT_ID: bridge-alert-service
+      MQTT_PORT: "1883"
+      MQTT_CLIENT_ID: bridge-alert-service-prod
       MQTT_TOPIC: bridges/alerts
-      STRESS_WARNING_RATIO: 0.8
-      STRESS_DANGER_RATIO: 1.0
+      STRESS_WARNING_RATIO: "0.8"
+      STRESS_DANGER_RATIO: "1.0"
+      GIN_MODE: release
+    ports:
+      - "8080:8080"
+      - "6060:6060"
+      - "9090:9090"
     depends_on:
       timescaledb:
         condition: service_healthy
       mqtt-broker:
-        condition: service_started
-    volumes:
-      - ./backend:/app
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/app/server", "--healthcheck"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging: *default-logging
+    networks:
+      - bridge-net
 
-  frontend:
-    image: nginx:alpine
+  nginx:
+    image: nginx:1.25.3-alpine
     container_name: ancient-bridge-frontend
+    hostname: nginx
+    restart: *default-restart
+    environment:
+      TZ: Asia/Shanghai
     ports:
       - "80:80"
     volumes:
-      - ./frontend:/usr/share/nginx/html
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend:/usr/share/nginx/html:ro
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+    networks:
+      - bridge-net
+
+  sensor-simulator:
+    build:
+      context: ./sensor-simulator
+      dockerfile: Dockerfile
+    container_name: ancient-bridge-simulator
+    hostname: sensor-simulator
+    restart: *default-restart
+    environment:
+      TZ: Asia/Shanghai
+      API_URL: http://backend:8080/api/v1
+      TRANSPORT: ${SIM_TRANSPORT:-both}
+      MQTT_HOST: mqtt-broker
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: bridges/sensors
+      MODE: ${SIM_MODE:-realtime}
+      INTERVAL: ${SIM_INTERVAL:-60}
+      DURATION: ${SIM_DURATION:-24}
+      DAYS: ${SIM_DAYS:-30}
+    depends_on:
+      backend:
+        condition: service_healthy
+      mqtt-broker:
+        condition: service_healthy
+    profiles:
+      - simulator
+    command: >
+      --mode ${SIM_MODE:-realtime}
+      --interval ${SIM_INTERVAL:-60}
+      --transport ${SIM_TRANSPORT:-both}
+    logging: *default-logging
+    networks:
+      - bridge-net
+
+  adminer:
+    image: adminer:4.8.1
+    container_name: ancient-bridge-adminer
+    hostname: adminer
+    restart: *default-restart
+    environment:
+      TZ: Asia/Shanghai
+      ADMINER_DEFAULT_SERVER: timescaledb
+      ADMINER_DEFAULT_USER: postgres
+      ADMINER_DEFAULT_PASSWORD: ${DB_PASSWORD:-postgres}
+    ports:
+      - "8081:8080"
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    profiles:
+      - debug
+    logging: *default-logging
+    networks:
+      - bridge-net
 
 volumes:
   db_data:
+    driver: local
   mqtt_data:
+    driver: local
   mqtt_log:
+    driver: local
+
+networks:
+  bridge-net:
+    driver: bridge
+    name: ancient-bridge-net
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
