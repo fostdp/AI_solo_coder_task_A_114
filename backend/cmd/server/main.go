@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -16,10 +17,16 @@ import (
 	"ancient-bridge-system/internal/dtu_receiver"
 	"ancient-bridge-system/internal/handlers"
 	"ancient-bridge-system/internal/messaging"
+	"ancient-bridge-system/internal/observability"
 	"ancient-bridge-system/internal/structural_simulator"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+)
+
+var (
+	buildStamp = "dev"
+	gitHash    = "local"
 )
 
 type App struct {
@@ -33,6 +40,8 @@ type App struct {
 	craftHandler      *handlers.CraftHandler
 	sensorDataHandler *handlers.SensorDataHandler
 	server            *http.Server
+	metricsServer     *http.Server
+	pprofServer       *http.Server
 }
 
 func NewApp() *App {
@@ -70,6 +79,7 @@ func (app *App) setupRoutes(r *gin.Engine) {
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization"}
 	r.Use(cors.New(corsConfig))
+	r.Use(observability.PrometheusMiddleware())
 
 	api := r.Group("/api/v1")
 
@@ -117,26 +127,71 @@ func (app *App) setupRoutes(r *gin.Engine) {
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status":  "ok",
-			"version": "1.0.0",
+			"status":      "ok",
+			"version":     "1.0.0",
+			"build_stamp": buildStamp,
+			"git_hash":    gitHash,
 			"modules": gin.H{
-				"dtu_receiver":        "running",
+				"dtu_receiver":         "running",
 				"structural_simulator": "running",
-				"craft_identifier":    "running",
-				"alarm_mqtt":          "running",
+				"craft_identifier":     "running",
+				"alarm_mqtt":           "running",
 			},
 		})
 	})
 }
 
+func (app *App) startMetricsServer() {
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", observability.MetricsHandler().HandlerFunc())
+
+	app.metricsServer = &http.Server{
+		Addr:         ":9090",
+		Handler:      metricsMux,
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	go func() {
+		log.Printf("Prometheus metrics server starting on :9090 (/metrics)")
+		if err := app.metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
+}
+
+func (app *App) startPprofServer() {
+	app.pprofServer = &http.Server{
+		Addr:         ":6060",
+		Handler:      observability.PprofHandler(),
+		ReadTimeout:  60 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+
+	go func() {
+		log.Printf("pprof server starting on :6060 (/debug/pprof)")
+		if err := app.pprofServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("pprof server error: %v", err)
+		}
+	}()
+}
+
 func (app *App) Shutdown() {
 	log.Println("Shutting down services...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if app.metricsServer != nil {
+		app.metricsServer.Shutdown(ctx)
+	}
+	if app.pprofServer != nil {
+		app.pprofServer.Shutdown(ctx)
+	}
 
 	app.bus.Close()
 	app.alarmMQTT.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 	if app.server != nil {
 		if err := app.server.Shutdown(ctx); err != nil {
 			log.Printf("Server shutdown error: %v", err)
@@ -146,7 +201,29 @@ func (app *App) Shutdown() {
 	log.Println("All services stopped")
 }
 
+func runHealthCheck() {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://localhost:8080/health")
+	if err != nil {
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func main() {
+	healthcheck := flag.Bool("healthcheck", false, "Run healthcheck and exit")
+	flag.Parse()
+
+	if *healthcheck {
+		runHealthCheck()
+	}
+
+	log.Printf("Starting server build=%s git=%s", buildStamp, gitHash)
+
 	app := NewApp()
 	defer app.Shutdown()
 
@@ -159,17 +236,26 @@ func main() {
 	}
 
 	app.server = &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
+		Addr:         ":" + port,
+		Handler:      r,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
+
+	app.startMetricsServer()
+	app.startPprofServer()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("Server starting on port %s", port)
-		log.Printf("API endpoint: http://localhost:%s/api/v1", port)
-		log.Println("Modules loaded: dtu_receiver, structural_simulator, craft_identifier, alarm_mqtt")
+		log.Printf("API server starting on port %s", port)
+		log.Printf("  API:      http://localhost:%s/api/v1", port)
+		log.Printf("  Health:   http://localhost:%s/health", port)
+		log.Printf("  Metrics:  http://localhost:9090/metrics")
+		log.Printf("  pprof:    http://localhost:6060/debug/pprof")
+		log.Println("Modules: dtu_receiver | structural_simulator | craft_identifier | alarm_mqtt")
 		if err := app.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Failed to start server: %v", err)
 		}
