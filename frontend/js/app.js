@@ -65,11 +65,9 @@ function setupEventListeners() {
         document.getElementById('positionValue').textContent = position.toFixed(1) + ' m';
     });
     
-    document.getElementById('craftLevel').addEventListener('input', (e) => {
-        const value = parseInt(e.target.value);
-        const stars = '★'.repeat(value) + '☆'.repeat(5 - value);
-        document.getElementById('craftLevelValue').textContent = stars;
-    });
+    if (window.craftPanel) {
+        window.craftPanel.init();
+    }
     
     document.querySelectorAll('.tab-btn').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -266,13 +264,12 @@ function stopAnimation() {
 }
 
 async function runCraftAnalysis() {
-    const woodSpecies = document.getElementById('woodSpecies').value;
-    const craftLevel = parseFloat(document.getElementById('craftLevel').value);
-    
-    const result = await bridgeAnalysis.runCraftAnalysis(currentBridgeId, woodSpecies, craftLevel);
-    
-    updateCraftDisplay(result);
-    switchTab('compare');
+    if (window.craftPanel) {
+        const result = await window.craftPanel.runAnalysis(currentBridgeId);
+        switchTab('compare');
+        return result;
+    }
+    return null;
 }
 
 function updateForcesTable(forces) {
@@ -340,63 +337,6 @@ function updateCompareTable(comparisons) {
         `;
         tbody.appendChild(row);
     });
-}
-
-function updateCraftDisplay(result) {
-    const tbody = document.getElementById('compareTableBody');
-    tbody.innerHTML = '';
-    
-    const rows = [
-        { label: '推断木材', value: result.wood_species },
-        { label: '木材等级', value: result.wood_grade },
-        { label: '榫卯类型', value: result.joinery_type },
-        { label: '置信度', value: (result.confidence_score * 100).toFixed(1) + '%' },
-        { label: '分析方法', value: result.method_used }
-    ];
-    
-    rows.forEach(r => {
-        const row = document.createElement('tr');
-        row.innerHTML = `
-            <td colspan="2"><strong>${r.label}</strong></td>
-            <td colspan="5">${r.value}</td>
-        `;
-        tbody.appendChild(row);
-    });
-    
-    if (result.construction_sequence && result.construction_sequence.length > 0) {
-        const headerRow = document.createElement('tr');
-        headerRow.innerHTML = `<td colspan="7" style="background:#f8f9fa;font-weight:600;">施工顺序推断</td>`;
-        tbody.appendChild(headerRow);
-        
-        result.construction_sequence.forEach((step, index) => {
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td colspan="2">步骤 ${index + 1}</td>
-                <td colspan="5">${step}</td>
-            `;
-            tbody.appendChild(row);
-        });
-    }
-    
-    if (result.feature_importance) {
-        const headerRow = document.createElement('tr');
-        headerRow.innerHTML = `<td colspan="7" style="background:#f8f9fa;font-weight:600;">特征重要性</td>`;
-        tbody.appendChild(headerRow);
-        
-        Object.entries(result.feature_importance).forEach(([key, value]) => {
-            const row = document.createElement('tr');
-            row.innerHTML = `
-                <td colspan="2">${key}</td>
-                <td colspan="5">
-                    <div style="background:#e0e0e0;border-radius:3px;height:8px;width:100%;">
-                        <div style="background:#3498db;border-radius:3px;height:100%;width:${value * 100}%"></div>
-                    </div>
-                    <span style="font-size:11px;color:#666;">${(value * 100).toFixed(1)}%</span>
-                </td>
-            `;
-            tbody.appendChild(row);
-        });
-    }
 }
 
 async function loadSensorData() {
