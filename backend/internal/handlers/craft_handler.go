@@ -7,16 +7,23 @@ import (
 
 	"ancient-bridge-system/internal/craft"
 	"ancient-bridge-system/internal/database"
+	"ancient-bridge-system/internal/dtu_receiver"
+	"ancient-bridge-system/internal/messaging"
 	"ancient-bridge-system/internal/models"
-	"ancient-bridge-system/internal/sensor"
 
 	"github.com/gin-gonic/gin"
 )
 
-type CraftHandler struct{}
+type CraftHandler struct {
+	bus *messaging.MessageBus
+	dtu *dtu_receiver.DTUReceiver
+}
 
-func NewCraftHandler() *CraftHandler {
-	return &CraftHandler{}
+func NewCraftHandler(bus *messaging.MessageBus, dtu *dtu_receiver.DTUReceiver) *CraftHandler {
+	return &CraftHandler{
+		bus: bus,
+		dtu: dtu,
+	}
 }
 
 type CraftAnalysisRequest struct {
@@ -72,35 +79,60 @@ func (h *CraftHandler) AnalyzeCraft(c *gin.Context) {
 		joineryFeatures.CraftsmanshipRating = 3.5
 	}
 
-	result := craft.AnalyzeCraft(woodFeatures, joineryFeatures, bridge.ConstructionMethod)
-
-	var analysisID int
-	err = database.DB.QueryRow(`
-		INSERT INTO craft_analysis 
-		(bridge_id, wood_species_predicted, wood_grade_predicted, construction_sequence,
-			joinery_type_predicted, confidence_score, method_used)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		RETURNING analysis_id
-	`, req.BridgeID, result.WoodSpecies, result.WoodGrade, result.ConstructionSequence,
-		result.JoineryType, result.ConfidenceScore, result.MethodUsed).Scan(&analysisID)
-
-	if err == nil {
-		go saveWoodTextureFeatures(req.BridgeID, woodFeatures)
+	busReq := &messaging.CraftAnalyzeRequest{
+		BridgeID:       req.BridgeID,
+		WoodSpecies:    req.WoodSpecies,
+		WoodFeatures:   woodFeatures,
+		JoineryFeature: joineryFeatures,
+		BridgeType:     bridge.ConstructionMethod,
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"analysis_id":   analysisID,
-		"bridge_id":     req.BridgeID,
-		"bridge_name":   bridge.Name,
-		"wood_species":  result.WoodSpecies,
-		"wood_grade":    result.WoodGrade,
-		"construction_sequence": result.ConstructionSequence,
-		"joinery_type":  result.JoineryType,
-		"confidence_score": result.ConfidenceScore,
-		"feature_importance": result.FeatureImportance,
-		"method_used":   result.MethodUsed,
-		"wood_features": woodFeatures,
-	})
+	replyChan := make(chan *messaging.Message, 1)
+	msg := messaging.NewMessage(messaging.MsgTypeCraftAnalyzeReq, busReq)
+	msg.ReplyTo = replyChan
+
+	select {
+	case h.bus.CraftAnalyzeReqChan <- msg:
+	case <-time.After(5 * time.Second):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Craft identifier busy"})
+		return
+	}
+
+	select {
+	case respMsg := <-replyChan:
+		resp, ok := respMsg.Payload.(*messaging.CraftAnalyzeResponse)
+		if !ok || resp.Error != "" {
+			errMsg := "Craft analysis failed"
+			if resp != nil && resp.Error != "" {
+				errMsg = resp.Error
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": errMsg})
+			return
+		}
+
+		result, _ := resp.Result.(*craft.CraftAnalysisResult)
+
+		if err == nil {
+			go saveWoodTextureFeatures(req.BridgeID, woodFeatures)
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"analysis_id":           resp.AnalysisID,
+			"bridge_id":             req.BridgeID,
+			"bridge_name":           bridge.Name,
+			"wood_species":          result.WoodSpecies,
+			"wood_grade":            result.WoodGrade,
+			"construction_sequence": result.ConstructionSequence,
+			"joinery_type":          result.JoineryType,
+			"confidence_score":      result.ConfidenceScore,
+			"feature_importance":    result.FeatureImportance,
+			"method_used":           result.MethodUsed,
+			"wood_features":         woodFeatures,
+		})
+
+	case <-time.After(30 * time.Second):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "Craft analysis timeout"})
+	}
 }
 
 func (h *CraftHandler) GetCraftHistory(c *gin.Context) {
@@ -176,20 +208,21 @@ func saveWoodTextureFeatures(bridgeID int, features *craft.WoodFeature) {
 }
 
 type SensorDataHandler struct {
-	ingestor *sensor.SensorDataIngestor
+	dtu *dtu_receiver.DTUReceiver
 }
 
-func NewSensorDataHandler() *SensorDataHandler {
+func NewSensorDataHandler(dtu *dtu_receiver.DTUReceiver) *SensorDataHandler {
 	return &SensorDataHandler{
-		ingestor: sensor.NewSensorDataIngestor(),
+		dtu: dtu,
 	}
 }
 
 type DTUIngestRequest struct {
-	DTUDeviceID string                 `json:"dtu_device_id" binding:"required"`
-	Timestamp   string                 `json:"timestamp"`
-	Sensors     []sensor.SensorReading `json:"sensors" binding:"required"`
-	RawData     interface{}            `json:"raw_data"`
+	DTUDeviceID string                        `json:"dtu_device_id" binding:"required"`
+	Timestamp   string                        `json:"timestamp"`
+	Readings    []dtu_receiver.SensorReading  `json:"readings" binding:"required"`
+	BridgeID    int                           `json:"bridge_id"`
+	RawData     interface{}                   `json:"raw_data"`
 }
 
 func (h *SensorDataHandler) IngestDTUData(c *gin.Context) {
@@ -204,23 +237,23 @@ func (h *SensorDataHandler) IngestDTUData(c *gin.Context) {
 		timestamp = time.Now().Format(time.RFC3339)
 	}
 
-	payload := sensor.DTUPayload{
+	payload := &dtu_receiver.DTUPayload{
 		DTUDeviceID: req.DTUDeviceID,
 		Timestamp:   timestamp,
-		Sensors:     req.Sensors,
-		RawData:     req.RawData,
+		Readings:    req.Readings,
+		BridgeID:    req.BridgeID,
 	}
 
-	err := h.ingestor.IngestDTUData(payload)
+	err := h.dtu.ProcessIngest(payload)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"status":  "success",
-		"message": "Data ingested successfully",
-		"sensors": len(req.Sensors),
+		"status":   "success",
+		"message":  "Data ingested successfully",
+		"readings": len(req.Readings),
 	})
 }
 
@@ -233,8 +266,16 @@ func (h *SensorDataHandler) GetSensorData(c *gin.Context) {
 	start, _ := time.Parse(time.RFC3339, startTime)
 	end, _ := time.Parse(time.RFC3339, endTime)
 	limitInt, _ := strconv.Atoi(limit)
+	sensorIDInt, _ := strconv.Atoi(sensorID)
 
-	data, err := sensor.GetSensorData(sensorIDToInt(sensorID), start, end, limitInt)
+	var data []models.SensorData
+	query := `
+		SELECT * FROM sensor_data
+		WHERE sensor_id = $1 AND timestamp BETWEEN $2 AND $3
+		ORDER BY timestamp DESC
+		LIMIT $4
+	`
+	err := database.DB.Select(&data, query, sensorIDInt, start, end, limitInt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -248,8 +289,16 @@ func (h *SensorDataHandler) GetSensorData(c *gin.Context) {
 
 func (h *SensorDataHandler) GetLatestSensorData(c *gin.Context) {
 	sensorID := c.Param("sensorId")
+	sensorIDInt, _ := strconv.Atoi(sensorID)
 
-	data, err := sensor.GetLatestSensorData(sensorIDToInt(sensorID))
+	var data models.SensorData
+	query := `
+		SELECT * FROM sensor_data
+		WHERE sensor_id = $1
+		ORDER BY timestamp DESC
+		LIMIT 1
+	`
+	err := database.DB.Get(&data, query, sensorIDInt)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "No data found"})
 		return
@@ -267,7 +316,13 @@ func (h *SensorDataHandler) GetEnvironmentalData(c *gin.Context) {
 	end, _ := time.Parse(time.RFC3339, endTime)
 	bridgeIDInt, _ := strconv.Atoi(bridgeID)
 
-	data, err := sensor.GetEnvironmentalData(bridgeIDInt, start, end)
+	var data []models.EnvironmentalData
+	query := `
+		SELECT * FROM environmental_data
+		WHERE bridge_id = $1 AND timestamp BETWEEN $2 AND $3
+		ORDER BY timestamp DESC
+	`
+	err := database.DB.Select(&data, query, bridgeIDInt, start, end)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -277,9 +332,4 @@ func (h *SensorDataHandler) GetEnvironmentalData(c *gin.Context) {
 		"total": len(data),
 		"data":  data,
 	})
-}
-
-func sensorIDToInt(s string) int {
-	id, _ := strconv.Atoi(s)
-	return id
 }
